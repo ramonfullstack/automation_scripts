@@ -61,6 +61,29 @@ OUTPUT_FILE=./bearer_tenant.txt
 npm run audit
 ```
 
+### Rodar continuamente (a cada X minutos)
+
+No `.env`, deixe:
+
+```env
+RUN_INTERVAL_MINUTES=30
+RUN_ONCE=false
+```
+
+E rode:
+
+```bash
+npm run audit:loop
+```
+
+### Rodar em background com nohup
+
+```bash
+npm run audit:nohup
+```
+
+Logs ficam em `audit.log`. Para parar depois, use `ps`/`kill` (ou reinicie o terminal).
+
 Captura:
 - ✅ Requisições após login no ERP
 - ✅ Filtra endpoint específico (TARGET_API)

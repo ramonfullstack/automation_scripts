@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "audit": "node audit.mjs",
+    "audit:loop": "RUN_ONCE=false node audit.mjs",
+    "audit:nohup": "RUN_ONCE=false nohup node audit.mjs > audit.log 2>&1 &",
     "audit:full": "node audit-full.mjs",
     "install:browsers": "npx playwright install"
   },
