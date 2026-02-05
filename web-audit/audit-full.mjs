@@ -1,10 +1,22 @@
 import { chromium } from "playwright";
 import crypto from "crypto";
 import dotenv from "dotenv";
+import fs from "fs/promises";
+import path from "path";
 
 dotenv.config();
 
 const TARGET_API = process.env.TARGET_API || "http://localhost:5214/api/InventoryStock/GetInventoryStockSummary";
+const TARGET_API_HINTS = [
+  "GetInventoryStockSummary",
+  "GetInventoryStock",
+];
+
+function looksLikeTarget(url) {
+  if (url === TARGET_API) return true;
+  const lower = url.toLowerCase();
+  return TARGET_API_HINTS.some((h) => lower.includes(String(h).toLowerCase()));
+}
 
 function maskBearer(authHeader) {
   if (!authHeader) return null;
@@ -13,6 +25,13 @@ function maskBearer(authHeader) {
   const token = authHeader.slice(7).trim();
   if (token.length < 20) return "Bearer [token_curto]";
   return `Bearer ${token.slice(0, 12)}...${token.slice(-8)}`;
+}
+
+function extractBearerToken(authHeader) {
+  if (!authHeader) return null;
+  const lower = authHeader.toLowerCase();
+  if (!lower.startsWith("bearer ")) return null;
+  return authHeader.slice(7).trim();
 }
 
 function sha256Short(value) {
@@ -102,8 +121,9 @@ function startNetworkAudit(page, { label, onlyTarget = false }) {
 
     if (onlyTarget && url !== TARGET_API) return;
 
-    const auth = headers["authorization"] || headers["Authorization"];
+  const auth = headers["authorization"] || headers["Authorization"];
     const tenant = pickTenant(headers);
+  const bearerToken = extractBearerToken(String(auth || ""));
 
     const item = {
       t: Date.now() - start,
@@ -113,6 +133,7 @@ function startNetworkAudit(page, { label, onlyTarget = false }) {
       hasBearer: !!auth && String(auth).toLowerCase().startsWith("bearer "),
       bearerMasked: maskBearer(String(auth || "")),
       bearerHash: auth ? sha256Short(String(auth)) : null,
+  bearerToken,
       tenantId: tenant ? String(tenant) : null,
       tenantHash: tenant ? sha256Short(String(tenant)) : null,
       origin: headers["origin"] || null,
@@ -123,6 +144,21 @@ function startNetworkAudit(page, { label, onlyTarget = false }) {
   });
 
   return hits;
+}
+
+async function appendTokenCapture({ token, tenantId, url }) {
+  if (!token || !tenantId) return;
+  const outputFile = process.env.OUTPUT_FILE || "./bearer_tenant.txt";
+  const filePath = path.resolve(process.cwd(), outputFile);
+  const lines = [
+    "tenantId",
+    tenantId,
+    "bearer",
+    token,
+    "---",
+    "",
+  ].join("\n");
+  await fs.appendFile(filePath, lines, { encoding: "utf8" });
 }
 
 function printSummary(hits, { title }) {
@@ -321,15 +357,31 @@ async function main() {
   try {
     await loginERP(page, ERP_USER, ERP_PASS);
   } catch (err) {
-    console.error(`\n❌ Erro no login: ${err.message}`);
-    await page.screenshot({ path: "login-error.png", fullPage: true });
-    console.log("📸 Screenshot salvo em: login-error.png");
+    console.error(`\n❌ Erro no ERP (vou seguir mesmo assim): ${err?.message || err}`);
+    try {
+      await page.screenshot({ path: "erp-error.png", fullPage: true });
+      console.log("📸 Screenshot salvo em: erp-error.png");
+    } catch {}
     await browser.close();
-    process.exit(1);
+    console.log("\n✨ Auditoria completa concluída (com falha no ERP).\n");
+    return;
   }
 
   // Observa tráfego geral pós-login
   const timeout = parseInt(process.env.TIMEOUT_OBSERVE) || 12000;
+  const stockRoute = process.env.ERP_STOCK_ROUTE || "#/stock";
+  const erpBase = (process.env.ERP_URL || "https://erp.dev.inovepic.dev/#/login").replace(/#.*$/, "");
+  const stockUrl = stockRoute.startsWith("http")
+    ? stockRoute
+    : `${erpBase}${stockRoute.startsWith("#") ? stockRoute : `#${stockRoute}`}`;
+
+  try {
+    console.log(`\n🧭 Indo para tela de estoque no ERP: ${stockUrl}`);
+    await page.goto(stockUrl, { waitUntil: "domcontentloaded", timeout: parseInt(process.env.TIMEOUT_NAV_ERP) || 60000 });
+  } catch (e) {
+    console.log(`⚠️  Não consegui navegar para a tela de estoque (${e?.message || e}). Vou observar mesmo assim.`);
+  }
+
   console.log(`\n👀 Observando tráfego por ${timeout}ms...`);
   await page.waitForTimeout(timeout);
   printSummary(erpHitsAll, { title: "ERP pós-login (todas requests)" });
@@ -338,14 +390,12 @@ async function main() {
   await auditLocalStorageAndCookies(page);
 
   // (D) Filtro só no endpoint alvo
-  const erpHitsTarget = erpHitsAll.filter(
-    (h) => h.method === "POST" && h.url === TARGET_API
-  );
+  const erpHitsTarget = erpHitsAll.filter((h) => h.method === "POST" && looksLikeTarget(h.url));
 
   console.log(`\n${"=".repeat(60)}`);
   console.log(`=== 🎯 Somente endpoint alvo ===`);
   console.log(`${"=".repeat(60)}`);
-  console.log(`Endpoint: ${TARGET_API}`);
+  console.log(`Endpoint (base): ${TARGET_API}`);
   console.log(`Ocorrências: ${erpHitsTarget.length}`);
 
   if (erpHitsTarget.length === 0) {
@@ -358,6 +408,12 @@ async function main() {
         `   🔑 Bearer: ${h.bearerMasked ?? "❌ não"}\n` +
         `   🏢 Tenant: ${h.tenantId ?? "❌ não"}\n`
       );
+
+      try {
+        await appendTokenCapture({ token: h.bearerToken, tenantId: h.tenantId, url: h.url });
+      } catch (e) {
+        console.log(`⚠️  Não consegui salvar token/tenant no arquivo: ${e?.message || e}`);
+      }
     }
   }
 

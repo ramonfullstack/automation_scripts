@@ -36,11 +36,6 @@ ERP_PASS=sua_senha
 
 # URLs
 ERP_URL=https://erp.dev.inovepic.dev/#/login
-FRONTEND_URL=http://localhost:4200
-
-# (Opcional) Swagger
-# SWAGGER_URL=http://localhost:5214/swagger
-SWAGGER_URL=
 
 # Endpoint alvo
 TARGET_API=http://localhost:5214/api/InventoryStock/GetInventoryStockSummary
@@ -48,7 +43,14 @@ TARGET_API=http://localhost:5214/api/InventoryStock/GetInventoryStockSummary
 # Configurações opcionais
 HEADLESS=true                # false para ver o browser aberto
 TIMEOUT_LOGIN=4000          # Tempo de espera após login (ms)
-TIMEOUT_OBSERVE=12000       # Tempo de observação do tráfego (ms)
+ERP_OBSERVE_MS=8000         # Tempo de observação do tráfego do ERP (ms)
+
+# Agendamento
+RUN_INTERVAL_MINUTES=30     # intervalo entre execuções
+RUN_ONCE=true               # true = executa uma vez; false = loop infinito
+
+# Saída com token completo + tenant
+OUTPUT_FILE=./bearer_tenant.txt
 ```
 
 ## 🚀 Como Usar
@@ -60,7 +62,6 @@ npm run audit
 ```
 
 Captura:
-- ✅ Requisições do **frontend local** (localhost:4200)
 - ✅ Requisições após login no ERP
 - ✅ Filtra endpoint específico (TARGET_API)
 - ✅ Mostra tokens mascarados e tenant IDs

@@ -1,6 +1,8 @@
 import { chromium } from "playwright";
 import crypto from "crypto";
 import dotenv from "dotenv";
+import fs from "fs/promises";
+import path from "path";
 
 dotenv.config();
 
@@ -20,6 +22,13 @@ function maskBearer(authHeader) {
   const token = authHeader.slice(7).trim();
   if (token.length < 20) return "Bearer [token_curto]";
   return `Bearer ${token.slice(0, 12)}...${token.slice(-8)}`; // máscara segura
+}
+
+function extractBearerToken(authHeader) {
+  if (!authHeader) return null;
+  const lower = authHeader.toLowerCase();
+  if (!lower.startsWith("bearer ")) return null;
+  return authHeader.slice(7).trim();
 }
 
 function sha256Short(value) {
@@ -133,8 +142,9 @@ function startNetworkAudit(page, { label, onlyTarget = false }) {
 
   if (onlyTarget && url !== TARGET_API) return;
 
-    const auth = headers["authorization"] || headers["Authorization"];
+  const auth = headers["authorization"] || headers["Authorization"];
     const tenant = pickTenant(headers);
+  const bearerToken = extractBearerToken(String(auth || ""));
 
     const item = {
       t: Date.now() - start,
@@ -144,6 +154,7 @@ function startNetworkAudit(page, { label, onlyTarget = false }) {
       hasBearer: !!auth && String(auth).toLowerCase().startsWith("bearer "),
       bearerMasked: maskBearer(String(auth || "")),
       bearerHash: auth ? sha256Short(String(auth)) : null, // fingerprint
+  bearerToken,
       tenantId: tenant ? String(tenant) : null,
       tenantHash: tenant ? sha256Short(String(tenant)) : null,
       origin: headers["origin"] || null,
@@ -154,6 +165,21 @@ function startNetworkAudit(page, { label, onlyTarget = false }) {
   });
 
   return hits;
+}
+
+async function appendTokenCapture({ token, tenantId, url }) {
+  if (!token || !tenantId) return;
+  const outputFile = process.env.OUTPUT_FILE || "./bearer_tenant.txt";
+  const filePath = path.resolve(process.cwd(), outputFile);
+  const lines = [
+    "tenantId",
+    tenantId,
+    "bearer",
+    token,
+    "---",
+    "",
+  ].join("\n");
+  await fs.appendFile(filePath, lines, { encoding: "utf8" });
 }
 
 function looksLikeTarget(url) {
@@ -197,134 +223,100 @@ async function main() {
 
   const ERP_USER = process.env.ERP_USER ?? "Ramon";
   const ERP_PASS = process.env.ERP_PASS ?? "dev123";
-  const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:4200";
-  const SWAGGER_URL = process.env.SWAGGER_URL ?? "";
   const HEADLESS = process.env.HEADLESS !== "false";
   const AUDIT_ERP = (process.env.AUDIT_ERP ?? "true").toLowerCase() === "true";
-  const FRONTEND_OBSERVE_MS = parseInt(process.env.FRONTEND_OBSERVE_MS) || 20000;
-  const WAIT_INTERACTIVE_MS = parseInt(process.env.WAIT_INTERACTIVE_MS) || 0;
+  const ERP_OBSERVE_MS = parseInt(process.env.ERP_OBSERVE_MS) || 8000;
+  const RUN_INTERVAL_MINUTES = parseInt(process.env.RUN_INTERVAL_MINUTES) || 30;
+  const RUN_ONCE = (process.env.RUN_ONCE ?? "true").toLowerCase() === "true";
 
   console.log(`📝 Configurações:`);
   console.log(`   Usuário: ${ERP_USER}`);
   console.log(`   Headless: ${HEADLESS}`);
   console.log(`   Endpoint alvo: ${TARGET_API}\n`);
 
-  const browser = await chromium.launch({ headless: HEADLESS });
-  const context = await browser.newContext();
-  const page = await context.newPage();
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  // (A) Captura as requests do frontend local (localhost:4200)
-  // Aqui é onde normalmente nasce o Origin e onde o browser vai disparar chamadas pro backend.
-  console.log(`\n🧭 Acessando Frontend local: ${FRONTEND_URL}`);
-  const feHits = startNetworkAudit(page, { label: "frontend", onlyTarget: false });
+  while (true) {
+    const browser = await chromium.launch({ headless: HEADLESS });
+    const context = await browser.newContext();
+    const page = await context.newPage();
 
-  try {
-    await page.goto(FRONTEND_URL, { waitUntil: "domcontentloaded", timeout: 15000 });
-    console.log(`👀 Observando tráfego do frontend por ${FRONTEND_OBSERVE_MS}ms...`);
-    await page.waitForTimeout(FRONTEND_OBSERVE_MS);
+    if (AUDIT_ERP) {
+      // (B) Login no ERP e captura requests pós-login
+      const erpHitsAll = startNetworkAudit(page, { label: "erp-all", onlyTarget: false });
 
-    if (WAIT_INTERACTIVE_MS > 0) {
-      console.log(`🕹️  Modo espera: você tem ${WAIT_INTERACTIVE_MS}ms pra usar o app e disparar o POST do estoque...`);
-      await page.waitForTimeout(WAIT_INTERACTIVE_MS);
-    }
-  } catch (err) {
-    console.log(`⚠️  Aviso: Não foi possível acessar o frontend (${err.message})`);
-  }
-
-  printSummary(feHits, { title: "Frontend local (localhost:4200)" });
-
-  // (A.2) Também destaca se o endpoint alvo já foi chamado pelo frontend
-  const feTargetHits = feHits.filter((h) => h.method === "POST" && looksLikeTarget(h.url));
-  console.log(`\n=== 🎯 Endpoint alvo via Frontend ===`);
-  console.log(`Ocorrências: ${feTargetHits.length}`);
-  for (const h of feTargetHits.slice(-10)) {
-    console.log(
-      `✅ POST ${h.url}\n` +
-      `   🔑 Bearer: ${h.bearerMasked ?? "❌ não"}\n` +
-      `   🏢 Tenant: ${h.tenantId ?? "❌ não"}\n`
-    );
-  }
-
-  // (A.1) Swagger opcional (se você quiser inspecionar também)
-  if (SWAGGER_URL && SWAGGER_URL.trim()) {
-    console.log(`\n📡 Acessando Swagger (opcional): ${SWAGGER_URL}`);
-    const swaggerHits = startNetworkAudit(page, { label: "swagger", onlyTarget: false });
-
-    try {
-      await page.goto(SWAGGER_URL, { waitUntil: "domcontentloaded", timeout: 15000 });
-      await page.waitForTimeout(6000);
-    } catch (err) {
-      console.log(`⚠️  Aviso: Não foi possível acessar o Swagger (${err.message})`);
-    }
-
-    printSummary(swaggerHits, { title: "Swagger (opcional)" });
-  }
-
-  if (AUDIT_ERP) {
-    // (B) Login no ERP e captura requests pós-login
-    const erpHitsAll = startNetworkAudit(page, { label: "erp-all", onlyTarget: false });
-
-    try {
-      await loginERP(page, ERP_USER, ERP_PASS);
-    } catch (err) {
-      console.error(`\n❌ Erro no ERP (vou seguir mesmo assim): ${err?.message || err}`);
-      console.log("💡 Dica: Se não precisar do ERP, defina AUDIT_ERP=false no .env");
       try {
-        await page.screenshot({ path: "erp-error.png", fullPage: true });
-        console.log("📸 Screenshot salvo em: erp-error.png");
-      } catch {}
-      // segue sem matar o script
-      await browser.close();
-      console.log("\n✨ Auditoria concluída (com falha no ERP).\n");
-      return;
-    }
-
-    // Observa tráfego geral pós-login
-    const timeout = parseInt(process.env.TIMEOUT_OBSERVE) || 12000;
-    const stockRoute = process.env.ERP_STOCK_ROUTE || "#/stock";
-    const erpBase = (process.env.ERP_URL || "https://erp.dev.inovepic.dev/#/login").replace(/#.*$/, "");
-    const stockUrl = stockRoute.startsWith("http")
-      ? stockRoute
-      : `${erpBase}${stockRoute.startsWith("#") ? stockRoute : `#${stockRoute}`}`;
-
-    try {
-      console.log(`\n🧭 Indo para tela de estoque no ERP: ${stockUrl}`);
-      await page.goto(stockUrl, { waitUntil: "domcontentloaded", timeout: parseInt(process.env.TIMEOUT_NAV_ERP) || 60000 });
-    } catch (e) {
-      console.log(`⚠️  Não consegui navegar para a tela de estoque (${e?.message || e}). Vou observar mesmo assim.`);
-    }
-
-    console.log(`\n👀 Observando tráfego por ${timeout}ms...`);
-    await page.waitForTimeout(timeout);
-    printSummary(erpHitsAll, { title: "ERP pós-login (todas requests)" });
-
-    // (C) Filtro só no endpoint alvo (InventoryStockSummary)
-    const erpHitsTarget = erpHitsAll.filter((h) => h.method === "POST" && looksLikeTarget(h.url));
-
-    console.log(`\n${"=".repeat(60)}`);
-    console.log(`=== 🎯 Somente endpoint alvo (via ERP) ===`);
-    console.log(`${"=".repeat(60)}`);
-  console.log(`Endpoint (base): ${TARGET_API}`);
-    console.log(`Ocorrências: ${erpHitsTarget.length}`);
-
-    if (erpHitsTarget.length === 0) {
-      console.log("\n⚠️  Nenhuma requisição para o endpoint alvo foi capturada via ERP!");
-    } else {
-      console.log("");
-      for (const h of erpHitsTarget.slice(-10)) {
-        console.log(
-          `✅ POST ${h.url}\n` +
-          `   🔑 Bearer: ${h.bearerMasked ?? "❌ não"}\n` +
-          `   🏢 Tenant: ${h.tenantId ?? "❌ não"}\n`
-        );
+        await loginERP(page, ERP_USER, ERP_PASS);
+      } catch (err) {
+        console.error(`\n❌ Erro no ERP (vou seguir mesmo assim): ${err?.message || err}`);
+        console.log("💡 Dica: Se não precisar do ERP, defina AUDIT_ERP=false no .env");
+        try {
+          await page.screenshot({ path: "erp-error.png", fullPage: true });
+          console.log("📸 Screenshot salvo em: erp-error.png");
+        } catch {}
+        await browser.close();
+        if (RUN_ONCE) break;
+        console.log(`\n⏳ Aguardando ${RUN_INTERVAL_MINUTES} minutos para próxima execução...`);
+        await sleep(RUN_INTERVAL_MINUTES * 60 * 1000);
+        continue;
       }
-    }
-  } else {
-    console.log("\nℹ️  AUDIT_ERP=false: pulando etapa do ERP.");
-  }
 
-  await browser.close();
-  console.log("\n✨ Auditoria concluída!\n");
+      // Observa tráfego geral pós-login
+      const stockRoute = process.env.ERP_STOCK_ROUTE || "#/stock";
+      const erpBase = (process.env.ERP_URL || "https://erp.dev.inovepic.dev/#/login").replace(/#.*$/, "");
+      const stockUrl = stockRoute.startsWith("http")
+        ? stockRoute
+        : `${erpBase}${stockRoute.startsWith("#") ? stockRoute : `#${stockRoute}`}`;
+
+      try {
+        console.log(`\n🧭 Indo para tela de estoque no ERP: ${stockUrl}`);
+        await page.goto(stockUrl, { waitUntil: "domcontentloaded", timeout: parseInt(process.env.TIMEOUT_NAV_ERP) || 60000 });
+      } catch (e) {
+        console.log(`⚠️  Não consegui navegar para a tela de estoque (${e?.message || e}). Vou observar mesmo assim.`);
+      }
+
+      console.log(`\n👀 Observando tráfego por ${ERP_OBSERVE_MS}ms...`);
+      await page.waitForTimeout(ERP_OBSERVE_MS);
+      printSummary(erpHitsAll, { title: "ERP pós-login (todas requests)" });
+
+      // (C) Filtro só no endpoint alvo (InventoryStockSummary)
+      const erpHitsTarget = erpHitsAll.filter((h) => h.method === "POST" && looksLikeTarget(h.url));
+
+      console.log(`\n${"=".repeat(60)}`);
+      console.log(`=== 🎯 Somente endpoint alvo (via ERP) ===`);
+      console.log(`${"=".repeat(60)}`);
+      console.log(`Endpoint (base): ${TARGET_API}`);
+      console.log(`Ocorrências: ${erpHitsTarget.length}`);
+
+      if (erpHitsTarget.length === 0) {
+        console.log("\n⚠️  Nenhuma requisição para o endpoint alvo foi capturada via ERP!");
+      } else {
+        console.log("");
+        for (const h of erpHitsTarget.slice(-10)) {
+          console.log(
+            `✅ POST ${h.url}\n` +
+            `   🔑 Bearer: ${h.bearerMasked ?? "❌ não"}\n` +
+            `   🏢 Tenant: ${h.tenantId ?? "❌ não"}\n`
+          );
+
+          try {
+            await appendTokenCapture({ token: h.bearerToken, tenantId: h.tenantId, url: h.url });
+          } catch (e) {
+            console.log(`⚠️  Não consegui salvar token/tenant no arquivo: ${e?.message || e}`);
+          }
+        }
+      }
+    } else {
+      console.log("\nℹ️  AUDIT_ERP=false: pulando etapa do ERP.");
+    }
+
+    await browser.close();
+    console.log("\n✨ Auditoria concluída!\n");
+
+    if (RUN_ONCE) break;
+    console.log(`\n⏳ Aguardando ${RUN_INTERVAL_MINUTES} minutos para próxima execução...`);
+    await sleep(RUN_INTERVAL_MINUTES * 60 * 1000);
+  }
 }
 
 main().catch((e) => {
