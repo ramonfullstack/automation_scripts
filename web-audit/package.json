@@ -1,0 +1,27 @@
+{
+  "name": "web-audit",
+  "version": "1.0.0",
+  "description": "Auditoria de requisições web com Playwright - captura Bearer tokens e tenant IDs",
+  "main": "audit.mjs",
+  "type": "module",
+  "scripts": {
+    "audit": "node audit.mjs",
+    "audit:full": "node audit-full.mjs",
+    "install:browsers": "npx playwright install"
+  },
+  "keywords": [
+    "playwright",
+    "audit",
+    "security",
+    "jwt",
+    "bearer"
+  ],
+  "author": "Ramon Silva",
+  "license": "ISC",
+  "devDependencies": {
+    "playwright": "^1.40.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1"
+  }
+}
